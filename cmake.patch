@@ -1,0 +1,46 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5fdc6345..84173661 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1199,6 +1199,15 @@ if (NOT EVENT__DISABLE_SAMPLES)
+                 sample/ssl-client-mbedtls.c)
+     endif()
+ 
++    add_executable(dns-blackhole sample/dns-blackhole.c)
++    target_link_libraries(dns-blackhole event_extra event_core ${LIB_APPS} ${LIB_PLATFORM})
++    if (EVENT__HAVE_PTHREADS)
++        target_link_libraries(dns-blackhole event_pthreads)
++    endif()
++    if (EVENT__HAVE_OPENSSL)
++        target_link_libraries(dns-blackhole event_openssl)
++    endif()
++
+     set(SAMPLES_WOPT
+         dns-example
+         ws-chat-server
+diff --git a/sample/include.am b/sample/include.am
+index 6c0e7b5e..59901b82 100644
+--- a/sample/include.am
++++ b/sample/include.am
+@@ -5,6 +5,7 @@
+ # See LICENSE for copying information.
+ 
+ SAMPLES = \
++	sample/dns-blackhole			\
+ 	sample/dns-example				\
+ 	sample/event-read-fifo			\
+ 	sample/hello-world				\
+@@ -53,6 +54,13 @@ sample_https_client_mbedtls_LDADD = libevent.la libevent_mbedtls.la $(MBEDTLS_LI
+ sample_https_client_mbedtls_CPPFLAGS = $(AM_CPPFLAGS) $(MBEDTLS_INCS) -DUSE_MBEDTLS
+ endif
+ 
++if PTHREADS
++SAMPLES += sample/dns-blackhole
++sample_dns_blackhole_proxy_SOURCES = sample/dns-blackhole.c
++sample_dns_blackhole_proxy_LDADD = libevent.la libevent_pthreads.la $(PTHREAD_LIBS) $(PTHREAD_LIBADD)
++sample_dns_blackhole_proxy_CPPFLAGS = $(AM_CPPFLAGS) $(PTHREAD_CFLAGS)
++endif
++
+ if BUILD_SAMPLES
+ noinst_PROGRAMS += $(SAMPLES)
+ endif
