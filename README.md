@@ -42,7 +42,7 @@ DNS blackhole server for resolve list of domain names to blackhole IP.
 Can be used to block some ads, malware, pop-ups sites or similar tasks.
 Author: Kuzin Andrey <kuzinandrey@yandex.ru>
 License: MIT
-Vcs: https://github.com/KuzinAndrey/kavdbhp
+Vcs: https://github.com/KuzinAndrey/dns-blackhole
 Version: v0.1
 
 Usage:
@@ -152,9 +152,9 @@ Run resolver thread
 
 ## TODO
 
-[ ] - debug any error to prevent production server to crash
-[ ] - try to remove wait resolver cycle and make it async
-[ ] - known error somewhere in OpenSSL that prevent to crash if use HTTPS server
+- [ ] debug any error to prevent production server to crash
+- [ ] try to remove wait resolver cycle and make it async
+- [ ] known error somewhere in OpenSSL that prevent to crash if use HTTPS server
 
 Crash log to analyze:
 ```
