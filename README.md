@@ -43,7 +43,7 @@ Can be used to block some ads, malware, pop-ups sites or similar tasks.
 Author: Kuzin Andrey <kuzinandrey@yandex.ru>
 License: MIT
 Vcs: https://github.com/KuzinAndrey/dns-blackhole
-Version: v0.1
+Version: v0.2
 
 Usage:
     bin/dns-blackhole [opts] <domains.txt>
@@ -53,7 +53,7 @@ Options:
     -d        - debug mode (increase verbosity)
     -n <ip>   - add backend DNS server IP address as resolver (can be multiple time),
                 if no any such option then try to use system configured NS servers
-    -t <n>    - backend resolve timeout n*1000 microsec (default 10000)
+    -t <n>    - backend resolve timeout in seconds 1..300 (default 5)
     -4 <ip>   - blackhole IPv4 address
     -6 <ip6>  - blackhole IPv6 address
     -s        - act as the blackhole (up server on HTTP/80 and HTTPS/443 if -k/-c provided)
