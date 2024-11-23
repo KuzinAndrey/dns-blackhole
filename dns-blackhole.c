@@ -12,6 +12,7 @@ History:
 	2024-11-17 - Add support HTTP & HTTPS blackhole, DNS on TCP,
 	             some statistics, first public commit
 	2024-11-22 - Remove wait resolve cycle, DNS in async
+	2024-11-23 - Add listen on IP -l option, some bug fix
 */
 
 #include <stdio.h>
@@ -69,6 +70,7 @@ static int opt_blackhole_ip6_set = 0;
 static struct in_addr opt_blackhole_ip4 = {0};
 static struct in6_addr opt_blackhole_ip6 = {0};
 static int opt_blackhole_server = 0;
+static const char *opt_listen_on_addr = "0.0.0.0";
 // static int opt_api_port = 0; // TODO
 
 #ifdef EVENT__HAVE_OPENSSL
@@ -76,7 +78,7 @@ static char *opt_https_key_file = NULL;
 static char *opt_https_cert_file = NULL;
 #endif
 
-#define PROGRAM_VERSION "v0.2"
+#define PROGRAM_VERSION "v0.3"
 
 // DOMAIN NAMES HASH TABLE
 ////////////////////////////////////////////
@@ -943,6 +945,7 @@ usage(const char *progname) {
 	"\t-n <ip>   - add backend DNS server IP address as resolver (can be multiple time),\n"
 	"\t            if no any such option then try to use system configured NS servers\n"
 	"\t-t <n>    - backend resolve timeout in seconds 1..300 (default %s)\n"
+	"\t-l <ip>   - listen on IP\n"
 	"\t-4 <ip>   - blackhole IPv4 address\n"
 	"\t-6 <ip6>  - blackhole IPv6 address\n"
 #ifdef EVENT__HAVE_OPENSSL
@@ -1030,6 +1033,18 @@ int main(int argc, char **argv) {
 		if (*e != 0 || (v <= 0 || v > 300)) {
 			fprintf(stderr, OPT_WRONG_VALUE_FOR_OPT, i - 1, argv[i - 1], argv[i]);
 		} else opt_timeout_upstream = argv[i];
+	} else if (0 == strcmp(argv[i], "-l")) { // Listen on IP
+		struct in_addr testip = {0};
+		if (i + 1 >= argc) {
+			fprintf(stderr, OPT_ERROR_IP_MUST_PROVIDE, "IPv4", i, argv[i]);
+			return 1;
+		} else i++;
+		if (!inet_pton(AF_INET, argv[i], &testip)) {
+			fprintf(stderr, OPT_ERROR_WRONG_IP, "IPv4", argv[i]);
+			return 1;
+		} else {
+			opt_listen_on_addr = argv[i];
+		}
 	} else if (0 == strcmp(argv[i], "-4")) { // Blackhole IPv4
 		if (i + 1 >= argc) {
 			fprintf(stderr, OPT_ERROR_IP_MUST_PROVIDE, "IPv4", i, argv[i]);
@@ -1237,7 +1252,8 @@ int main(int argc, char **argv) {
 	// DNS server address
 	server_addr.sin_family = AF_INET;
 	server_addr.sin_port = htons(DNS_PORT);
-	server_addr.sin_addr.s_addr = INADDR_ANY;
+	printf("Listen on IP: %s\n", opt_listen_on_addr);
+	inet_pton(AF_INET, opt_listen_on_addr, &server_addr.sin_addr.s_addr);
 
 	// Create DNS server on UDP 53 port
 	dns_udpsock = socket(PF_INET, SOCK_DGRAM, 0);
@@ -1289,7 +1305,7 @@ int main(int argc, char **argv) {
 
 		evhttp_set_gencb(http_server, http_process_request, NULL);
 
-		blackhole_http_socket = evhttp_bind_socket(http_server, "0.0.0.0", 80);
+		blackhole_http_socket = evhttp_bind_socket(http_server, opt_listen_on_addr, 80);
 		if (blackhole_http_socket < 0) {
 			fprintf(stderr, "ERROR: Can't call %s()\n", "http_bind_socket");
 			goto exit_error;
@@ -1348,7 +1364,7 @@ int main(int argc, char **argv) {
 			evhttp_set_gencb(https_server, http_process_request, NULL);
 
 			// Create HTTPS server
-			https_socket_handle = evhttp_bind_socket_with_handle(https_server, "0.0.0.0", 443);
+			https_socket_handle = evhttp_bind_socket_with_handle(https_server, opt_listen_on_addr, 443);
 			if (!https_socket_handle) {
 				fprintf(stderr, "ERROR: Can't call %s()\n", "evhttp_bind_socket_with_handle");
 				goto exit_error;
