@@ -11,6 +11,7 @@ History:
 	2024-11-16 - First production ready DNS part on UDP
 	2024-11-17 - Add support HTTP & HTTPS blackhole, DNS on TCP,
 	             some statistics, first public commit
+	2024-11-22 - Remove wait resolve cycle, DNS in async
 */
 
 #include <stdio.h>
@@ -61,7 +62,7 @@ History:
 static struct event_base *event_main_base = NULL;
 
 static int opt_debug = 0;
-static int opt_timeout_upstream = 10000;
+static const char *opt_timeout_upstream = "5";
 static char *opt_file_name = NULL;
 static int opt_blackhole_ip4_set = 0;
 static int opt_blackhole_ip6_set = 0;
@@ -75,7 +76,7 @@ static char *opt_https_key_file = NULL;
 static char *opt_https_cert_file = NULL;
 #endif
 
-#define PROGRAM_VERSION "v0.1"
+#define PROGRAM_VERSION "v0.2"
 
 // DOMAIN NAMES HASH TABLE
 ////////////////////////////////////////////
@@ -190,21 +191,17 @@ static struct event_base *event_resolver_base = NULL;
 static struct evdns_base *evdns_resolver_base = NULL;
 
 struct resolver_result {
-	int resolved;
+	pthread_mutex_t mutex;
+	struct evdns_server_request *req;
+	int resolves_in_progress;
+	int in_callback;
 	char type;
-	int ttl;
-	int rr_count;
-	union {
-		ev_uint32_t *a;
-		struct in6_addr *aaaa;
-		char *ptr_name;
-		void *raw;
-		struct evdns_reply_ns *ns;
-		struct evdns_reply_mx *mx;
-		struct evdns_reply_soa *soa;
-		struct evdns_reply_txt *txt;
-	} data;
-	char *cname;
+};
+
+struct resolve_name {
+	struct resolver_result *work;
+	char type;
+	char *question;
 };
 
 static struct statistics {
@@ -225,136 +222,126 @@ static struct statistics {
 
 static void
 resolver_callback(int result, char type, int count, int ttl, void *addrs, void *data) {
-	struct resolver_result *r = data;
+	struct resolve_name *rn = data;
+	struct resolver_result *work = rn->work;
 	char buf[INET6_ADDRSTRLEN+1];
 	const char *s;
-	int i, j;
+	int i, j, r;
+	int make_respond = 0;
 
-	r->rr_count = 0;
-	r->ttl = ttl;
 	stat.resolves++;
 
 	if (!addrs && !count) {
-		r->resolved = 1;
-		return;
+		if (rn->question) free(rn->question);
+		free(rn);
+		goto send_respond;
 	}
 
 	switch (type) {
 	case DNS_IPv4_A: // 1
 		DEBUG(" -- resolved A: %d rec (ttl = %d)", count, ttl);
-		r->data.a = calloc(count, sizeof(r->data.a[0]));
-		if (!r->data.a) break;
-		memcpy(r->data.a, addrs, count * sizeof(r->data.a[0]));
-		for (i = 0; i < count; ++i) {
-			s = evutil_inet_ntop(AF_INET, &r->data.a[i], buf, sizeof(buf));
-			if (s) DEBUG("\t%d: %s", i, s);
+		for (i = 0; i < work->req->nquestions; ++i) {
+			struct in_addr *a = addrs;
+			if (0 != strcasecmp(work->req->questions[i]->name, rn->question)) continue;
+			for (j = 0; j < count; ++j) {
+				s = evutil_inet_ntop(AF_INET, &a[j], buf, sizeof(buf));
+				if (s) DEBUG("\t%d: %s", j, s);
+				r = evdns_server_request_add_a_reply(work->req,
+					work->req->questions[i]->name, 1, &a[j], ttl);
+				if (r < 0) { DEBUG("err %d", r); } else stat.type_a++;
+			}
 		}
-		r->rr_count = count;
-		stat.type_a++;
 		break;
 
 	case DNS_PTR: // 2
-		r->data.ptr_name = strdup(addrs);
-		if (!r->data.ptr_name) break;
-		DEBUG("PTR: %s", r->data.ptr_name);
-		r->rr_count = 1;
-		stat.type_ptr++;
+		for (i = 0; i < work->req->nquestions; ++i) {
+			if (0 != strcasecmp(work->req->questions[i]->name, rn->question)) continue;
+			r = evdns_server_request_add_ptr_reply(work->req, NULL,
+				work->req->questions[i]->name, addrs, ttl);
+			if (r < 0) { DEBUG("err %d", r); } else stat.type_ptr++;
+		}
 		break;
 
 	case DNS_IPv6_AAAA: // 3
 		DEBUG(" -- resolved AAAA: %d rec (ttl = %d)", count, ttl);
-		r->data.aaaa = calloc(count, sizeof(r->data.aaaa[0]));
-		if (!r->data.aaaa) break;
-		memcpy(r->data.aaaa, addrs, count * sizeof(r->data.aaaa[0]));
-		for (i = 0; i < count; ++i) {
-			s = evutil_inet_ntop(AF_INET6, &r->data.aaaa[i], buf, sizeof(buf));
-			if (s) DEBUG("\t%d: %s", i, s);
+		for (i = 0; i < work->req->nquestions; ++i) {
+			struct in6_addr *aaaa = addrs;
+			if (0 != strcasecmp(work->req->questions[i]->name, rn->question)) continue;
+			for (j = 0; j < count; ++j) {
+				s = evutil_inet_ntop(AF_INET6, &aaaa[j], buf, sizeof(buf));
+				if (s) DEBUG("\t%d: %s", j, s);
+				r = evdns_server_request_add_aaaa_reply(work->req,
+					work->req->questions[i]->name, 1, &aaaa[j], ttl);
+				if (r < 0) { DEBUG("err %d", r); } else stat.type_aaaa++;
+			}
 		}
-		r->rr_count = count;
-		stat.type_aaaa++;
 		break;
 
 	case DNS_CNAME: // 4
-		r->cname = strdup((char*)addrs);
-		if (!r->cname) break;
-		DEBUG(" -- resolved CNAME: %s (ttl = %d)", r->cname, ttl);
-		// r->rr_count = 1;
-		stat.type_cname++;
+		DEBUG(" -- resolved CNAME: %s (ttl = %d)", (char *)addrs, ttl);
+		for (i = 0; i < work->req->nquestions; ++i) {
+			if (0 != strcasecmp(work->req->questions[i]->name, rn->question)) continue;
+			r = evdns_server_request_add_cname_reply(work->req,
+				work->req->questions[i]->name, addrs, ttl);
+			if (r < 0) { DEBUG("err %d", r); } else stat.type_cname++;
+		}
 		break;
 
 	case DNS_NS: // 5
-		struct evdns_reply_ns *ns = addrs;
-		r->data.ns = calloc(count, sizeof(r->data.ns[0]));
-		if (!r->data.ns) break;
 		DEBUG(" -- resolved NS: %d rec (ttl = %d)", count, ttl);
-		for (i = 0; i < count; ++i) {
-			r->data.ns[r->rr_count].name = strdup(ns[i].name);
-			if (!r->data.ns[r->rr_count].name) continue;
-			DEBUG("\t%d: %s", i, r->data.ns[r->rr_count].name);
-			r->rr_count++;
+		for (i = 0; i < work->req->nquestions; ++i) {
+			struct evdns_reply_ns *ns = addrs;
+			if (0 != strcasecmp(work->req->questions[i]->name, rn->question)) continue;
+			for (j = 0; j < count; ++j) {
+				
+				r = evdns_server_request_add_ns_reply(work->req,
+					work->req->questions[i]->name, ns[j].name, ttl);
+				if (r < 0) { DEBUG("err %d", r); } else stat.type_ns++;
+			}
 		}
-		stat.type_ns++;
 		break;
 
 	case DNS_MX: // 6
-		struct evdns_reply_mx *mx = addrs;
-		r->data.mx = calloc(count, sizeof(r->data.mx[0]));
-		if (!r->data.mx) break;
 		DEBUG(" -- resolved MX: %d rec (ttl = %d)", count, ttl);
-		for (i = 0; i < count; ++i) {
-			memcpy(&r->data.mx[r->rr_count], &mx[i], sizeof(mx[i]));
-			r->data.mx[r->rr_count].name = strdup(mx[i].name);
-			if (!r->data.mx[r->rr_count].name) continue;
-			DEBUG("\t%d: %s", i, r->data.mx[r->rr_count].name);
-			r->rr_count++;
+		for (i = 0; i < work->req->nquestions; ++i) {
+			struct evdns_reply_mx *mx = addrs;
+			if (0 != strcasecmp(work->req->questions[i]->name, rn->question)) continue;
+			for (j = 0; j < count; ++j) {
+				r = evdns_server_request_add_mx_reply(work->req,
+					work->req->questions[i]->name, &mx[j], ttl);
+				if (r < 0) { DEBUG("err %d", r); } else stat.type_mx++;
+			}
 		}
-		stat.type_mx++;
 		break;
 
 	case DNS_SOA: // 7
 	case DNS_SOA_AUTH: // 9
 		struct evdns_reply_soa *soa = addrs;
-		r->data.soa = calloc(count, sizeof(r->data.soa[0]));
-		if (!r->data.soa) break;
-		DEBUG(" -- resolved %s: %d rec (ttl = %d)",
-			(type == DNS_SOA ? "SOA":"SOA_AUTH"), count, ttl);
-		for (i = 0; i < count; ++i) {
-			memcpy(&r->data.soa[r->rr_count], &soa[i], sizeof(soa[i]));
-			r->data.soa[r->rr_count].nsname = strdup(soa[i].nsname);
-			if (!r->data.soa[r->rr_count].nsname) continue;
-			r->data.soa[r->rr_count].email = strdup(soa[i].email);
-			if (!r->data.soa[r->rr_count].email) {
-				free(r->data.soa[r->rr_count].nsname);
-				continue;
+		DEBUG(" -- resolved SOA%s: (ttl = %d)", (type == DNS_SOA ? "":"_AUTH"), ttl);
+		for (i = 0; i < work->req->nquestions; ++i) {
+			if (0 != strcasecmp(work->req->questions[i]->name, rn->question)) continue;
+			r = evdns_server_request_add_soa_reply(work->req,
+				work->req->questions[i]->name, soa,
+				(type == DNS_SOA_AUTH ? 1:0), ttl);
+			if (r < 0) { DEBUG("err %d", r); } else {
+				if (type == DNS_SOA_AUTH) stat.type_soa_auth++;
+				else stat.type_soa++;
 			}
-			DEBUG("\t%d: %s %s", i, r->data.soa[r->rr_count].nsname,
-				r->data.soa[r->rr_count].email);
-			r->rr_count++;
 		}
-		if (type == DNS_SOA) stat.type_soa++;
-		if (type == DNS_SOA_AUTH) stat.type_soa_auth++;
 		break;
 
 	case DNS_TXT: // 8
-		struct evdns_reply_txt *txt = addrs;
-		r->data.txt = calloc(count, sizeof(r->data.txt[0]));
-		if (!r->data.txt) break;
 		DEBUG(" -- resolved TXT: %d rec (ttl = %d)", count, ttl);
-		for (i = 0; i < count; ++i) {
-			size_t total_len = 0, len; char *p = txt[i].text;
-			for (j = 0; j < txt[i].parts; j++) {
-				len = strlen(p) + 1;
-				total_len += len;
-				p += len;
+		for (i = 0; i < work->req->nquestions; ++i) {
+			struct evdns_reply_txt *txt = addrs;
+			if (0 != strcasecmp(work->req->questions[i]->name, rn->question)) continue;
+			for (j = 0; j < count; ++j) {
+				DEBUG("\t%d [parts=%d]: [%s]", j, txt[j].parts, txt[j].text);
+				r = evdns_server_request_add_txt_reply(work->req,
+					work->req->questions[i]->name, &txt[j], ttl);
+				if (r < 0) { DEBUG("err %d", r); } else stat.type_txt++;
 			}
-			r->data.txt[r->rr_count].parts = txt[i].parts;
-			r->data.txt[r->rr_count].text = calloc(1, total_len);
-			if (!r->data.txt[r->rr_count].text) continue;
-			memcpy(r->data.txt[r->rr_count].text, txt[i].text, total_len);
-			DEBUG("\t%d: %s", i, r->data.txt[r->rr_count].text);
-			r->rr_count++;
 		}
-		stat.type_txt++;
 		break;
 
 	default:
@@ -363,41 +350,60 @@ resolver_callback(int result, char type, int count, int ttl, void *addrs, void *
 		break;
 	} // switch
 
-	r->resolved = (type == r->type);
+	if (rn->type == type || (type == DNS_SOA_AUTH && result != 0)) {
+		if (type == DNS_SOA_AUTH) {
+			DEBUG(" -- get soa_auth with err=%d (%s)", result, evdns_err_to_string(result));
+		}
+		free(rn->question); free(data);
+	} else return;
 
-	/*
-	 * type of answer not match with request, but receive DNS_SOA_AUTH
-	 * this mean error was, make it resolved with type SOA_AUTH
-	 */
-	if (!r->resolved && type == DNS_SOA_AUTH && result != 0) {
-		DEBUG(" -- get soa_auth with err=%d (%s)", result, evdns_err_to_string(result));
-		r->type = DNS_SOA_AUTH;
-		r->resolved = 1;
-	}
+send_respond:
 
+	while (work->in_callback) usleep(10);
+
+	pthread_mutex_lock(&work->mutex);
+		work->resolves_in_progress--;
+		if (work->resolves_in_progress == 0) make_respond = 1;
+	pthread_mutex_unlock(&work->mutex);
+
+	if (!make_respond) return;
+
+	r = evdns_server_request_respond(work->req, 0);
+	if (r < 0) DEBUG("Can't send reply");
+
+	free(work);
 } // resolver_callback()
-
-#define SEND_SOA_AUTH_IF_PRESENT \
-	} else if (myreq.type == DNS_SOA_AUTH && myreq.data.soa) { \
-	DEBUG(" -- send %s for %s...", "SOA_AUTH", req->questions[i]->name); \
-	DEBUG("\t%s, %s = %d", myreq.data.soa->nsname, myreq.data.soa->email, myreq.data.soa->serial); \
-	r = evdns_server_request_add_soa_reply(req, req->questions[i]->name, \
-		myreq.data.soa, 1, myreq.ttl); \
-	if (r < 0) DEBUG("err %d", r); \
-	free(myreq.data.soa->nsname); \
-	free(myreq.data.soa->email); \
-	free(myreq.data.soa);
 
 static void
 server_callback(struct evdns_server_request *req, void *data)
 {
-	int i, j, r;
-	int waitreq;
-	struct resolver_result myreq;
+	int i, r;
+	struct resolver_result *work;
+	struct resolve_name *rn;
+	struct evdns_request *new_resolve;
 	struct str_hash *hash;
 	(void)data;
 
-	memset(&myreq, 0, sizeof(struct resolver_result));
+#define PREPARE_RN \
+	rn = calloc(1, sizeof(struct resolve_name)); \
+	if (!rn) break; \
+	rn->work = work; \
+	rn->question = strdup(req->questions[i]->name); \
+	if (!rn->question) { free(rn); break; }
+
+#define CLEAR_RN \
+	if (!new_resolve) { free(rn->question); free(rn); } else { \
+		pthread_mutex_lock(&work->mutex); \
+		work->resolves_in_progress++; \
+		pthread_mutex_unlock(&work->mutex); \
+	}
+
+	work = calloc(1, sizeof(struct resolver_result));
+	if (!work) goto error;
+
+	work->req = req;
+	work->in_callback = 1;
+	pthread_mutex_init(&work->mutex, NULL);
 	stat.requests++;
 
 	for (i = 0; i < req->nquestions; ++i) {
@@ -421,101 +427,38 @@ server_callback(struct evdns_server_request *req, void *data)
 				break;
 			}
 			DEBUG(" -- Try resolve %s for %s", "A", req->questions[i]->name);
-			myreq.type = DNS_IPv4_A;
-			evdns_base_resolve_ipv4(evdns_resolver_base, req->questions[i]->name,
-				DNS_CNAME_CALLBACK, resolver_callback, &myreq);
-			waitreq = opt_timeout_upstream;
-			while (waitreq > 0) {
-				if (!myreq.resolved) { usleep(1000); waitreq--; continue; }
-				if (myreq.type == DNS_IPv4_A && myreq.data.a) {
-					if (myreq.cname) {
-						DEBUG(" -- send CNAME %s for %s...", myreq.cname, req->questions[i]->name);
-						r = evdns_server_request_add_cname_reply(req, req->questions[i]->name,
-							myreq.cname, myreq.ttl);
-						if (r < 0) DEBUG("err %d", r);
-						free(myreq.cname);
-					}
-					DEBUG(" -- send %d %s for %s...", myreq.rr_count, "IPv4", req->questions[i]->name);
-					for (j = 0; j < myreq.rr_count; ++j) {
-						r = evdns_server_request_add_a_reply(req,
-							req->questions[i]->name, 1, &myreq.data.a[j], myreq.ttl);
-						if (r < 0) DEBUG("err %d", r);
-					}
-					free(myreq.data.a);
-					SEND_SOA_AUTH_IF_PRESENT
-				} else DEBUG("!?? %d", myreq.type);
-				break;
-			}
-			if (waitreq == 0) DEBUG(" -- %s timeout for %s", "A", req->questions[i]->name);
+			PREPARE_RN
+			rn->type = DNS_IPv4_A;
+			new_resolve = evdns_base_resolve_ipv4(evdns_resolver_base, req->questions[i]->name,
+				DNS_CNAME_CALLBACK, resolver_callback, rn);
+			CLEAR_RN
 			break;
 
 		case EVDNS_TYPE_NS: // 2
 			DEBUG(" -- Try resolve %s for %s", "NS", req->questions[i]->name);
-			myreq.type = DNS_NS;
-			evdns_base_resolve_ns(evdns_resolver_base, req->questions[i]->name, 0, resolver_callback, &myreq);
-			waitreq = opt_timeout_upstream;
-			while (waitreq > 0) {
-				if (!myreq.resolved) { usleep(1000); waitreq--; continue; }
-				if (myreq.type == DNS_NS && myreq.data.ns) {
-					DEBUG(" -- send %d %s for %s...", myreq.rr_count, "NS", req->questions[i]->name);
-					for (j = 0; j < myreq.rr_count; ++j) {
-						DEBUG("\t%d: %s", j, myreq.data.ns[j].name);
-						r = evdns_server_request_add_ns_reply(req,
-							req->questions[i]->name,
-							myreq.data.ns[j].name, myreq.ttl);
-						if (r < 0) DEBUG("err %d", r);
-						free(myreq.data.ns[j].name);
-					}
-					free(myreq.data.ns);
-					SEND_SOA_AUTH_IF_PRESENT
-				} else DEBUG("!?? %d", myreq.type);
-				break;
-			}
-			if (waitreq == 0) DEBUG(" -- %s timeout for %s", "NS", req->questions[i]->name);
+			PREPARE_RN
+			rn->type = DNS_NS;
+			new_resolve = evdns_base_resolve_ns(evdns_resolver_base, req->questions[i]->name,
+				0, resolver_callback, rn);
+			CLEAR_RN
 			break;
 
 		case EVDNS_TYPE_CNAME: // 5
 			DEBUG(" -- Try resolve %s for %s", "CNAME", req->questions[i]->name);
-			myreq.type = DNS_CNAME;
-			evdns_base_resolve_cname(evdns_resolver_base, req->questions[i]->name, 0, resolver_callback, &myreq);
-			waitreq = opt_timeout_upstream;
-			while (waitreq > 0) {
-				if (!myreq.resolved) { usleep(1000); waitreq--; continue; }
-				DEBUG("type = %d, cname = %s", myreq.type, myreq.cname ? myreq.cname : "NULL");
-				if (myreq.type == DNS_CNAME && myreq.cname) {
-					DEBUG(" -- send %d %s for %s...", myreq.rr_count, "CNAME", req->questions[i]->name);
-					r = evdns_server_request_add_cname_reply(req, req->questions[i]->name,
-						myreq.cname, myreq.ttl);
-					if (r < 0) DEBUG("err %d", r);
-					free(myreq.cname);
-					SEND_SOA_AUTH_IF_PRESENT
-				} else DEBUG("!?? %d", myreq.type);
-				break;
-			}
-			if (waitreq == 0) DEBUG(" -- %s timeout for %s", "CNAME", req->questions[i]->name);
+			PREPARE_RN
+			rn->type = DNS_CNAME;
+			new_resolve = evdns_base_resolve_cname(evdns_resolver_base, req->questions[i]->name,
+				0, resolver_callback, rn);
+			CLEAR_RN
 			break;
 
 		case EVDNS_TYPE_SOA: // 6
 			DEBUG(" -- Try resolve %s for %s", "SOA", req->questions[i]->name);
-			myreq.type = DNS_SOA;
-			evdns_base_resolve_soa(evdns_resolver_base, req->questions[i]->name, 0, resolver_callback, &myreq);
-			waitreq = opt_timeout_upstream;
-			while (waitreq > 0) {
-				if (!myreq.resolved) { usleep(1000); waitreq--; continue; }
-				if (myreq.type == DNS_SOA && myreq.data.soa) {
-					DEBUG(" -- send %s for %s...", "SOA", req->questions[i]->name);
-					DEBUG("\t%s, %s = %d", myreq.data.soa->nsname, myreq.data.soa->email, myreq.data.soa->serial);
-					r = evdns_server_request_add_soa_reply(req, req->questions[i]->name,
-						myreq.data.soa, 0, myreq.ttl);
-					if (r < 0) DEBUG("err %d", r);
-					free(myreq.data.soa->nsname);
-					free(myreq.data.soa->email);
-					free(myreq.data.soa);
-					SEND_SOA_AUTH_IF_PRESENT
-				} else DEBUG("!?? %d", myreq.type);
-				break;
-			}
-			if (waitreq == 0) DEBUG(" -- %s timeout for %s", "SOA", req->questions[i]->name);
+			PREPARE_RN
+			rn->type = DNS_SOA;
+			new_resolve = evdns_base_resolve_soa(evdns_resolver_base, req->questions[i]->name,
+				0, resolver_callback, rn);
+			CLEAR_RN
 			break;
 
 		case EVDNS_TYPE_PTR: // 12
@@ -535,111 +478,48 @@ server_callback(struct evdns_server_request *req, void *data)
 				}
 			}
 			DEBUG(" -- Try resolve %s for %s", "PTR", req->questions[i]->name);
-			myreq.type = DNS_PTR;
-			evdns_base_resolve_reverse(evdns_resolver_base, &ptr_ip, 0, resolver_callback, &myreq);
-			waitreq = opt_timeout_upstream;
-			while (waitreq > 0) {
-				if (!myreq.resolved) { usleep(1000); waitreq--; continue; }
-				if (myreq.type == DNS_PTR && myreq.data.ptr_name) {
-					DEBUG(" -- send %d %s for %s...", myreq.rr_count, "PTR", req->questions[i]->name);
-					DEBUG("\tptr: %s", myreq.data.ptr_name);
-					r = evdns_server_request_add_ptr_reply(req, NULL, req->questions[i]->name,
-						myreq.data.ptr_name, myreq.ttl);
-					if (r < 0) DEBUG("err %d", r);
-					free(myreq.data.ptr_name);
-				} else DEBUG("!?? %d", myreq.type);
-				break;
-			}
-			if (waitreq == 0) DEBUG(" -- %s timeout for %s", "PTR", req->questions[i]->name);
+			PREPARE_RN
+			rn->type = DNS_PTR;
+			new_resolve = evdns_base_resolve_reverse(evdns_resolver_base, &ptr_ip,
+				0, resolver_callback, rn);
+			CLEAR_RN
 			break;
 
 		case EVDNS_TYPE_MX: // 15
 			DEBUG(" -- Try resolve %s for %s", "MX", req->questions[i]->name);
-			myreq.type = DNS_MX;
-			evdns_base_resolve_mx(evdns_resolver_base, req->questions[i]->name,
-				0, resolver_callback, &myreq);
-			waitreq = opt_timeout_upstream;
-			while (waitreq > 0) {
-				if (!myreq.resolved) { usleep(1000); waitreq--; continue; }
-				if (myreq.type == DNS_MX && myreq.data.mx) {
-					DEBUG(" -- send %d %s for %s...", myreq.rr_count, "MX", req->questions[i]->name);
-					for (j = 0; j < myreq.rr_count; ++j) {
-						DEBUG("\t%d: %s = %d", j, myreq.data.mx[j].name, myreq.data.mx[j].pref);
-						r = evdns_server_request_add_mx_reply(req, req->questions[i]->name,
-							&myreq.data.mx[j], myreq.ttl);
-						if (r < 0) DEBUG("err %d", r);
-						free(myreq.data.mx[j].name);
-					}
-					free(myreq.data.mx);
-					SEND_SOA_AUTH_IF_PRESENT
-				} else DEBUG("!?? %d", myreq.type);
-				break;
-			}
-			if (waitreq == 0) DEBUG(" -- %s timeout for %s", "MX", req->questions[i]->name);
+			PREPARE_RN
+			rn->type = DNS_MX;
+			new_resolve = evdns_base_resolve_mx(evdns_resolver_base, req->questions[i]->name,
+				0, resolver_callback, rn);
+			CLEAR_RN
 			break;
 
 		case EVDNS_TYPE_TXT: // 16
 			DEBUG(" -- Try resolve %s for %s", "TXT", req->questions[i]->name);
-			myreq.type = DNS_TXT;
-			evdns_base_resolve_txt(evdns_resolver_base, req->questions[i]->name,
-				0, resolver_callback, &myreq);
-			waitreq = opt_timeout_upstream;
-			while (waitreq > 0) {
-				if (!myreq.resolved) { usleep(1000); waitreq--; continue; }
-				if (myreq.type == DNS_TXT && myreq.data.txt) {
-					DEBUG(" -- send %d %s for %s...", myreq.rr_count, "TXT", req->questions[i]->name);
-					for (j = 0; j < myreq.rr_count; ++j) {
-						DEBUG("\t%d[parts=%d]: [%s]", j, myreq.data.txt[j].parts, myreq.data.txt[j].text);
-						r = evdns_server_request_add_txt_reply(req, req->questions[i]->name,
-							&myreq.data.txt[j], myreq.ttl);
-						if (r < 0) DEBUG("err %d", r);
-						free(myreq.data.txt[j].text);
-					}
-					free(myreq.data.txt);
-					SEND_SOA_AUTH_IF_PRESENT
-				} else DEBUG("!?? %d", myreq.type);
-				break;
-			}
-			if (waitreq == 0) DEBUG(" -- %s timeout for %s", "TXT", req->questions[i]->name);
+			PREPARE_RN
+			rn->type = DNS_TXT;
+			new_resolve = evdns_base_resolve_txt(evdns_resolver_base, req->questions[i]->name,
+				0, resolver_callback, rn);
+			CLEAR_RN
 			break;
 
 		case EVDNS_TYPE_AAAA: // 28
 			hash = domain_is_blocked(htable, req->questions[i]->name);
 			if (hash) {
 				DEBUG(" -- Send blackhole %s IP for %s", "AAAA", req->questions[i]->name);
-				evdns_server_request_add_aaaa_reply(req,
+				r = evdns_server_request_add_aaaa_reply(req,
 					req->questions[i]->name, 1, &opt_blackhole_ip6, blackhole_ttl);
+				if (r < 0) DEBUG("err %d", r);
 				stat.blocked++;
 				hash->hit++;
 				break;
 			}
 			DEBUG(" -- Try resolve %s for %s", "AAAA", req->questions[i]->name);
-			myreq.type = DNS_IPv6_AAAA;
-			evdns_base_resolve_ipv6(evdns_resolver_base, req->questions[i]->name,
-				DNS_CNAME_CALLBACK, resolver_callback, &myreq);
-			waitreq = opt_timeout_upstream;
-			while (waitreq > 0) {
-				if (!myreq.resolved) { usleep(1000); waitreq--; continue; }
-				if (myreq.type == DNS_IPv6_AAAA && myreq.data.aaaa) {
-					if (myreq.cname) {
-						DEBUG(" -- send CNAME %s for %s...", myreq.cname, req->questions[i]->name);
-						r = evdns_server_request_add_cname_reply(req, req->questions[i]->name,
-							myreq.cname, myreq.ttl);
-						if (r < 0) DEBUG("err %d", r);
-						free(myreq.cname);
-					}
-					DEBUG(" -- send %d %s for %s...", myreq.rr_count, "IPv6", req->questions[i]->name);
-					for (j = 0; j < myreq.rr_count; ++j) {
-						r = evdns_server_request_add_aaaa_reply(req,
-							req->questions[i]->name, 1, &myreq.data.aaaa[j], myreq.ttl);
-						if (r < 0) DEBUG("err %d", r);
-					}
-					free(myreq.data.aaaa);
-					SEND_SOA_AUTH_IF_PRESENT
-				} else DEBUG("!?? %d", myreq.type);
-				break;
-			}
-			if (waitreq == 0) DEBUG(" -- %s timeout for %s", "AAAA", req->questions[i]->name);
+			PREPARE_RN
+			rn->type = DNS_IPv6_AAAA;
+			new_resolve = evdns_base_resolve_ipv6(evdns_resolver_base, req->questions[i]->name,
+				DNS_CNAME_CALLBACK, resolver_callback, rn);
+			CLEAR_RN
 			break;
 
 		default:
@@ -648,6 +528,16 @@ server_callback(struct evdns_server_request *req, void *data)
 			break;
 		} // switch
 	} // for
+
+	if (work->resolves_in_progress != 0) { // can check without mutex (because in_callback == 1)
+		work->in_callback = 0;
+		return;
+	}
+
+	work->in_callback = 0;
+
+error:
+	if (work) free(work);
 
 	r = evdns_server_request_respond(req, 0);
 	if (r < 0) DEBUG("Can't send reply");
@@ -1028,7 +918,7 @@ usage(const char *progname) {
 	"\t-d        - debug mode (increase verbosity)\n"
 	"\t-n <ip>   - add backend DNS server IP address as resolver (can be multiple time),\n"
 	"\t            if no any such option then try to use system configured NS servers\n"
-	"\t-t <n>    - backend resolve timeout n*1000 microsec (default %d)\n"
+	"\t-t <n>    - backend resolve timeout in seconds 1..300 (default %s)\n"
 	"\t-4 <ip>   - blackhole IPv4 address\n"
 	"\t-6 <ip6>  - blackhole IPv6 address\n"
 #ifdef EVENT__HAVE_OPENSSL
@@ -1109,13 +999,13 @@ int main(int argc, char **argv) {
 	} else if (0 == strcmp(argv[i], "-t")) { // Timeout
 		char *e; long v = 0;
 		if (i + 1 >= argc) {
-			fprintf(stderr, "ERROR: You must provide timeout integer value for option \"%s\"\n", argv[i]);
+			fprintf(stderr, "ERROR: You must provide timeout integer value [1..300] for option \"%s\"\n", argv[i]);
 			return 1;
 		} else i++;
 		v = strtol(argv[i], &e, 10);
-		if (*e != 0 || (v <= 0 || v > 60000)) {
+		if (*e != 0 || (v <= 0 || v > 300)) {
 			fprintf(stderr, OPT_WRONG_VALUE_FOR_OPT, i - 1, argv[i - 1], argv[i]);
-		} else opt_timeout_upstream = v;
+		} else opt_timeout_upstream = argv[i];
 	} else if (0 == strcmp(argv[i], "-4")) { // Blackhole IPv4
 		if (i + 1 >= argc) {
 			fprintf(stderr, OPT_ERROR_IP_MUST_PROVIDE, "IPv4", i, argv[i]);
@@ -1254,6 +1144,11 @@ int main(int argc, char **argv) {
 	evdns_resolver_base = evdns_base_new(event_resolver_base, 0);
 	if (!evdns_resolver_base) {
 		fprintf(stderr, "ERROR: Can't create new %s\n","evdns_resolver_base");
+		goto exit_error;
+	}
+
+	if (0 != evdns_base_set_option(evdns_resolver_base, "timeout", opt_timeout_upstream)) {
+		fprintf(stderr, "ERROR: Can't set timeout \"%s\" for resolver\n", opt_timeout_upstream);
 		goto exit_error;
 	}
 

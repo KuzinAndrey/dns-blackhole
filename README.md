@@ -153,7 +153,7 @@ Run resolver thread
 ## TODO
 
 - [ ] debug any error to prevent production server to crash
-- [ ] try to remove wait resolver cycle and make it async
+- [x] try to remove wait resolver cycle and make it async
 - [ ] known error somewhere in OpenSSL that prevent to crash if use HTTPS server
 
 Crash log to analyze:
@@ -171,8 +171,8 @@ Load 50 zones in memory:
     - file size: 997
 Libevent version: "2.2.1-alpha-dev" /home/avkuzin/github/libevent/sample/dns-blackhole.c:1228
 Set system nameservers: 2
-    [0] 77.108.97.135 (IPv4)
-    [1] 77.108.97.140 (IPv4)
+    [0] 8.8.8.8 (IPv4)
+    [1] 8.8.4.4 (IPv4)
 Blackhole IP: 192.168.2.33
 DNS server listening on UDP port 53
 DNS server listening on TCP port 53
