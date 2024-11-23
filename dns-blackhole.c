@@ -232,11 +232,7 @@ resolver_callback(int result, char type, int count, int ttl, void *addrs, void *
 
 	stat.resolves++;
 
-	if (!addrs && !count) {
-		if (rn->question) free(rn->question);
-		free(rn);
-		goto send_respond;
-	}
+	if (!addrs && !count) goto send_respond;
 
 	switch (type) {
 	case DNS_IPv4_A: // 1
@@ -367,8 +363,10 @@ resolver_callback(int result, char type, int count, int ttl, void *addrs, void *
 	if (rn->type == type || (type == DNS_SOA_AUTH && result != 0)) {
 		if (type == DNS_SOA_AUTH) {
 			DEBUG(" -- get soa_auth with err=%d (%s)", result, evdns_err_to_string(result));
+			/* If we get SOA_AUTH with error, libevent make other call
+			 * again with empty addrs & count. Here we must do nothing. */
+			return;
 		}
-		free(rn->question); free(data);
 	} else return;
 
 send_respond:
@@ -385,7 +383,9 @@ send_respond:
 	r = evdns_server_request_respond(work->req, 0);
 	if (r < 0) DEBUG("Can't send reply");
 
-	free(work);
+	free(rn->question);
+	free(rn->work);
+	free(rn);
 } // resolver_callback()
 
 static void
