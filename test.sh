@@ -40,6 +40,14 @@ done << EOF
 5.255.255.70
 EOF
 
+# SRV records
+while read H; do
+	echo "[SRV = $H]"
+	dig +noall +answer SRV $H @$NS
+done << EOF
+_ldap._tcp.google.com
+EOF
+
 # blocked names
 while read H; do
 	dig +noall +answer $H @$NS

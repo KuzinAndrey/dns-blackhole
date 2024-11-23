@@ -214,6 +214,7 @@ static struct statistics {
 	uint64_t type_cname;
 	uint64_t type_ns;
 	uint64_t type_mx;
+	uint64_t type_srv;
 	uint64_t type_soa;
 	uint64_t type_txt;
 	uint64_t type_soa_auth;
@@ -340,6 +341,19 @@ resolver_callback(int result, char type, int count, int ttl, void *addrs, void *
 				r = evdns_server_request_add_txt_reply(work->req,
 					work->req->questions[i]->name, &txt[j], ttl);
 				if (r < 0) { DEBUG("err %d", r); } else stat.type_txt++;
+			}
+		}
+		break;
+
+	case DNS_SRV: // 10
+		DEBUG(" -- resolved SRV: %d rec (ttl = %d)", count, ttl);
+		for (i = 0; i < work->req->nquestions; ++i) {
+			struct evdns_reply_srv *srv = addrs;
+			if (0 != strcasecmp(work->req->questions[i]->name, rn->question)) continue;
+			for (j = 0; j < count; ++j) {
+				r = evdns_server_request_add_srv_reply(work->req,
+					work->req->questions[i]->name, &srv[j], ttl);
+				if (r < 0) { DEBUG("err %d", r); } else stat.type_srv++;
 			}
 		}
 		break;
@@ -519,6 +533,15 @@ server_callback(struct evdns_server_request *req, void *data)
 			rn->type = DNS_IPv6_AAAA;
 			new_resolve = evdns_base_resolve_ipv6(evdns_resolver_base, req->questions[i]->name,
 				DNS_CNAME_CALLBACK, resolver_callback, rn);
+			CLEAR_RN
+			break;
+
+		case EVDNS_TYPE_SRV: // 33
+			DEBUG(" -- Try resolve %s for %s", "SRV", req->questions[i]->name);
+			PREPARE_RN
+			rn->type = DNS_SRV;
+			new_resolve = evdns_base_resolve_srv(evdns_resolver_base, req->questions[i]->name,
+				0, resolver_callback, rn);
 			CLEAR_RN
 			break;
 
@@ -737,6 +760,7 @@ int www_apistatus_handler(struct evhttp_request *req, struct evbuffer *buf) {
 	W("%s=%" PRIu64 "\n", "CNAME", stat.type_cname);
 	W("%s=%" PRIu64 "\n", "NS", stat.type_ns);
 	W("%s=%" PRIu64 "\n", "MX", stat.type_mx);
+	W("%s=%" PRIu64 "\n", "SRV", stat.type_srv);
 	W("%s=%" PRIu64 "\n", "SOA", stat.type_soa);
 	W("%s=%" PRIu64 "\n", "TXT", stat.type_txt);
 	W("%s=%" PRIu64 "\n", "SOA_AUTH", stat.type_soa_auth);
